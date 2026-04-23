@@ -37,7 +37,7 @@ The following diagram shows where externalization fits in the agent loop:
 
 ```mermaid
 sequenceDiagram
-    participant Plugin as ToolResultExternalizationPlugin
+    participant Plugin as ContextOffloader
     participant Agent
     participant Model
     participant Tool
@@ -47,39 +47,44 @@ sequenceDiagram
     Agent->>Tool: execute tool
     Tool-->>Agent: tool result (potentially large)
     Agent->>Plugin: AfterToolCallEvent
-    Note over Plugin: if result > sizeThreshold:<br/>persist full output to storage backend<br/>replace content with preview + reference
+    Note over Plugin: if result > maxResultTokens:<br/>persist full output to storage backend<br/>replace content with preview + reference
     Agent->>Agent: append tool result message
     Note over Agent: go to next cycle
 ```
 
-The plugin accepts a `sizeThreshold` (default 10,000 characters) and a pluggable `ExternalizationStrategy` that controls where the full output is stored:
+The plugin accepts a required `storage` parameter implementing the `Storage` interface, and a configurable `maxResultTokens` threshold (default 2,500 tokens). Token estimation uses the model's `countTokens` method (tiktoken when available, chars/4 heuristic fallback):
 
 ```typescript
-export interface ExternalizationStrategy {
-  externalize(content: string, toolName: string): Promise<string> | string
+export interface Storage {
+  store(key: string, content: Buffer, contentType?: string): Promise<string> | string
+  retrieve(reference: string): Promise<[Buffer, string]> | [Buffer, string]
 }
 ```
 
-The SDK ships three built-in strategies:
+The SDK ships three built-in implementations:
 
-| Strategy | Behavior | Use case |
-|----------|----------|----------|
-| `InMemoryExternalizationStrategy` | Stores content in memory. Zero config, no filesystem side effects. | Default. Context window optimization without persistence. |
-| `FileExternalizationStrategy` | Writes to a local directory. | Debugging, auditing, offline retrieval. |
-| `S3ExternalizationStrategy` | Writes to an S3 bucket. Follows the `S3SessionManager` pattern. | Production workloads, shared storage. |
+| Implementation | Behavior | Use case |
+|----------------|----------|----------|
+| `InMemoryStorage` | Stores content in memory. Zero filesystem side effects. Content type preserved per block. | Testing, serverless, context-only optimization. |
+| `FileStorage` | Writes to a local directory with `.metadata.json` sidecar for content type tracking. | Debugging, auditing, offline retrieval. |
+| `S3Storage` | Writes to an S3 bucket. Content type preserved via S3 object metadata. Follows `S3SessionManager` patterns. | Production workloads, shared storage. |
 
-The default is `InMemoryExternalizationStrategy` because the primary value of externalization is context window optimization, not artifact persistence. Long-running agents are exactly the use case where context pressure matters most, and they do not benefit from writing artifacts to disk. Users who need persistence can opt into `FileExternalizationStrategy` or `S3ExternalizationStrategy`.
+Storage is a required parameter — the user must explicitly choose a backend. This avoids implicit behavior and makes the persistence model clear.
 
-When a tool result exceeds `sizeThreshold`, the hook passes the content to the strategy. The strategy stores the full output and returns a reference. The plugin then replaces the original content with a truncated preview plus that reference.
+When a tool result exceeds `maxResultTokens`, each content block is stored individually to the storage backend with its content type preserved. The plugin then replaces the original content with a truncated preview plus per-block references.
 
 The replacement content looks like:
 
 ```
-[Externalized: 125,432 chars | ref: mem://abc123]
+[Offloaded: 3 blocks, ~5,432 tokens]
+[Use the preview below to answer if possible. If you need the full content,
+call retrieve_offloaded_content with a reference.]
 
-<first 4,000 characters as preview>
+<first N tokens as preview>
 
-[Full output stored externally: mem://abc123]
+[Stored references:]
+  mem_1_tooluse_abc123_0 (text, 12,345 chars)
+  mem_1_tooluse_abc123_1 (json, 8,901 bytes)
 ```
 
 ### Content Type Handling
@@ -88,52 +93,52 @@ Tool results can contain multiple content block types. The plugin handles each t
 
 | Type | Behavior |
 |------|----------|
-| Text | Externalized: stored in the backend, replaced with a truncated preview. |
-| JSON | Serialized via `JSON.stringify` (or `json.dumps` in Python), then externalized alongside text. |
-| Image | Replaced with a `[image: format, N bytes]` placeholder. Follows the `SlidingWindowConversationManager` pattern. |
-| Document | Replaced with a `[document: format, name, N bytes]` placeholder. |
+| Text | Stored as `text/plain`, replaced with a truncated preview. |
+| JSON | Stored as `application/json` (serialized), replaced with a preview. |
+| Image | Stored in native format (e.g., `image/png`), replaced with a placeholder + reference. |
+| Document | Stored in native format (e.g., `application/pdf`), replaced with a placeholder + reference. |
 
-The plugin measures the combined character count of all text and JSON blocks. If the total exceeds `sizeThreshold`, it externalizes the text content and replaces image and document blocks with lightweight placeholders.
+Each content block is stored individually with its content type preserved. The plugin estimates the total token count of the tool result using the model's `countTokens` method. If the total exceeds `maxResultTokens`, it stores all blocks and replaces the result with a preview plus per-block references.
 
 ### Retrieval Tool
 
-The plugin vends a built-in retrieval tool that the agent can call to fetch externalized content by reference. This avoids requiring the user to separately configure a file-reading or S3 tool, and keeps the storage backend opaque to the model. The retrieval tool also supports the aliasing use case ([#1678](https://github.com/strands-agents/sdk-python/issues/1678)) because the model never needs to know where or how the content is stored.
+The plugin vends a built-in `retrieve_offloaded_content` tool that the agent can call to fetch offloaded content by reference. Retrieval returns content in its native type: text as string, JSON as a JSON block, images as image blocks, documents as document blocks. This avoids requiring the user to separately configure a file-reading or S3 tool, and keeps the storage backend opaque to the model. Retrieval results are excluded from re-offloading to prevent circular offload loops.
 
-This operates at tool execution time, before the result enters the conversation history. It prevents a single large result from consuming a disproportionate share of the context window. The full output is preserved in the configured storage backend for later retrieval by the agent or the user.
+The plugin also injects guidance into the system prompt (via `BeforeInvocationEvent`) instructing the agent to prefer the preview and only retrieve when needed.
 
 ### SDK Changes Required
 
-**New file: `plugins/tool-result-externalization.ts`.** Contains the `ToolResultExternalizationPlugin` class and its config interface.
-
-Artifact filenames include the tool name and a timestamp for traceability. When using file or S3 storage, the artifact directory or prefix is created on first write. Cleanup of stored artifacts is the user's responsibility.
+**New package: `plugins/context-offloader/`.** Contains the `ContextOffloader` plugin class, `Storage` interface, built-in storage implementations, and the `retrieve_offloaded_content` tool.
 
 ## Developer Experience
 
 ```typescript
 import {
   Agent,
-  ToolResultExternalizationPlugin,
-  FileExternalizationStrategy,
-  S3ExternalizationStrategy,
+  ContextOffloader,
+  InMemoryStorage,
+  FileStorage,
+  S3Storage,
 } from '@strands-agents/sdk'
 
-// In-memory (default): zero config, context reduction only
+// In-memory: context reduction only
 const agent = new Agent({
   tools: [dataAnalysis, apiClient, fileProcessor],
   plugins: [
-    new ToolResultExternalizationPlugin({
-      sizeThreshold: 10_000,
+    new ContextOffloader({
+      storage: new InMemoryStorage(),
     }),
   ],
 })
 
-// File storage: persists artifacts to disk
+// File storage: persists artifacts to disk, custom thresholds
 const agent = new Agent({
   tools: [dataAnalysis, apiClient, fileProcessor],
   plugins: [
-    new ToolResultExternalizationPlugin({
-      sizeThreshold: 10_000,
-      strategy: new FileExternalizationStrategy({ artifactDir: './my-artifacts' }),
+    new ContextOffloader({
+      storage: new FileStorage({ artifactDir: './my-artifacts' }),
+      maxResultTokens: 5_000,
+      previewTokens: 2_000,
     }),
   ],
 })
@@ -142,9 +147,8 @@ const agent = new Agent({
 const agent = new Agent({
   tools: [dataAnalysis, apiClient, fileProcessor],
   plugins: [
-    new ToolResultExternalizationPlugin({
-      sizeThreshold: 10_000,
-      strategy: new S3ExternalizationStrategy({
+    new ContextOffloader({
+      storage: new S3Storage({
         bucket: 'my-agent-artifacts',
         prefix: 'tool-results/',
       }),
@@ -165,15 +169,19 @@ The current `SlidingWindowConversationManager` already truncates large results, 
 
 Instead of a plugin, externalization could be a per-tool config or an agent-level setting. This would be more discoverable but would not compose as cleanly with other plugins. The plugin pattern keeps externalization independent and opt-in.
 
+### 3. Strategy Pattern (Bundled Storage + Preview)
+
+An alternative interface bundles storage and preview generation into a single `externalize()` method. This is more flexible for custom formatting but couples two concerns. The separate storage protocol enables the retrieval tool to call `retrieve()` directly without understanding the preview format.
+
 ## Consequences
 
 ### What Becomes Easier
 
-Large tool results no longer blow up the context window or get silently discarded. The full output is preserved in the configured storage backend while the conversation receives a compact preview. The built-in retrieval tool allows the agent to fetch the full output on demand without requiring the user to configure a separate file or S3 tool.
+Large tool results no longer blow up the context window or get silently discarded. The full output is preserved in the configured storage backend while the conversation receives a compact preview. The built-in retrieval tool allows the agent to fetch the full output on demand without requiring the user to configure separate file or S3 tools.
 
 ### What Becomes Harder or Requires Attention
 
-When using file or S3 storage, artifacts accumulate and require cleanup. The preview may not contain the information the model needs, leading to follow-up retrieval tool calls. The `sizeThreshold` is character-based, not token-based, which is a rough proxy.
+Storage requires explicit configuration — there is no implicit default. When using file or S3 storage, artifacts accumulate and require cleanup. The preview may not contain the information the model needs, leading to follow-up retrieval tool calls.
 
 ### Migration
 
