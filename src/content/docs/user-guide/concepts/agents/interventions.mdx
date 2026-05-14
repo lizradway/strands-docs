@@ -1,0 +1,104 @@
+---
+title: Interventions
+description: "A composable control layer for authorization, guardrails, and steering with typed actions, ordered evaluation, and short-circuiting."
+languages: [typescript]
+---
+
+Interventions are a composable control layer for agents. They provide a typed action model for common control concerns — authorization, guardrails, steering, and content transformation — with ordered evaluation and short-circuiting. Unlike raw [hooks](./hooks.mdx) which mutate event objects directly, intervention handlers return typed decisions (`proceed`, `deny`, `guide`, `interrupt`, `transform`) that the framework applies with well-defined semantics.
+
+## Basic Usage
+
+Create an intervention handler by extending `InterventionHandler` and overriding the lifecycle methods you need. Register handlers via the `interventions` option in agent configuration:
+
+```typescript
+--8<-- "user-guide/concepts/agents/interventions.ts:basic_usage"
+```
+
+Handlers only need to override the lifecycle methods relevant to their concern — all methods default to `proceed()`.
+
+## Action Types
+
+Each lifecycle method returns one of five typed actions:
+
+| Action | Factory | Description |
+|--------|---------|-------------|
+| Proceed | `InterventionActions.proceed(reason?)` | Allow the operation to continue unchanged |
+| Deny | `InterventionActions.deny(reason)` | Block the operation. Short-circuits remaining handlers |
+| Guide | `InterventionActions.guide(feedback, reason?)` | Cancel and provide feedback for the model to retry with |
+| Interrupt | `InterventionActions.interrupt(prompt, reason?)` | Pause for human approval (beforeToolCall only) |
+| Transform | `InterventionActions.transform(apply, reason?)` | Modify event content in-place before execution continues |
+
+```typescript
+--8<-- "user-guide/concepts/agents/interventions.ts:action_types"
+```
+
+## Lifecycle Methods
+
+Intervention handlers can override five lifecycle methods. Each method supports a specific subset of actions:
+
+| Method | Valid Actions | When it Runs |
+|--------|-------------|--------------|
+| `beforeInvocation` | Proceed, Deny, Guide, Transform | Before the agent loop starts |
+| `beforeToolCall` | Proceed, Deny, Guide, Interrupt, Transform | Before each tool execution |
+| `afterToolCall` | Proceed, Transform | After each tool execution |
+| `beforeModelCall` | Proceed, Deny, Guide, Transform | Before each model API call |
+| `afterModelCall` | Proceed, Guide, Transform | After each model response |
+
+How actions behave depends on the lifecycle method:
+
+| Action | Before events | After events |
+|--------|--------------|--------------|
+| **Deny** | Sets `event.cancel`, short-circuits remaining handlers | No effect (warns at runtime) |
+| **Guide** | On `beforeToolCall`/`beforeInvocation`: cancels with accumulated feedback. On `beforeModelCall`: injects feedback as user message | On `afterModelCall`: injects feedback and retries |
+| **Interrupt** | Calls `event.interrupt()` for human-in-the-loop pause | Not supported |
+| **Transform** | Calls `action.apply(event)` — later handlers see modified content | Calls `action.apply(event)` |
+
+## Evaluation Order and Short-Circuiting
+
+Handlers evaluate in **registration order**. If any handler returns `deny()`, remaining handlers are skipped — the operation is blocked immediately. This enables efficient pipelines where fast checks (like authorization) run first and prevent expensive evaluations (like LLM-based steering) from running unnecessarily.
+
+```typescript
+--8<-- "user-guide/concepts/agents/interventions.ts:short_circuiting"
+```
+
+For `guide()` actions, all handlers continue to run and their feedback is accumulated — the model receives combined guidance from all guiding handlers.
+
+## Error Handling
+
+The `onError` property controls what happens when a handler throws an exception:
+
+| Value | Behavior |
+|-------|----------|
+| `'throw'` | Rethrow the error (default). The invocation fails. |
+| `'proceed'` | Log the error and continue as if `proceed()` was returned. |
+| `'deny'` | Log the error and treat it as a `deny()` (fail-closed). |
+
+```typescript
+--8<-- "user-guide/concepts/agents/interventions.ts:error_handling"
+```
+
+Use `'deny'` for security-critical handlers where a failure should block execution. Use `'proceed'` for non-critical handlers like logging where availability is more important than enforcement.
+
+## Composing Interventions
+
+Interventions are designed to compose. A typical production agent might combine authorization (fast, deterministic), content transformation (PII redaction), and steering (LLM-guided tone) — each as an independent handler with a single responsibility:
+
+```typescript
+--8<-- "user-guide/concepts/agents/interventions.ts:composed_example"
+```
+
+## Interventions vs Hooks vs Plugins
+
+| | Hooks | Plugins | Interventions |
+|-|-------|---------|---------------|
+| **Interface** | Callback functions | Classes with `initAgent` | Classes with lifecycle methods |
+| **Communication** | Mutate event properties | Mutate event properties | Return typed actions |
+| **Ordering** | Explicit `HookOrder` | Registration order | Registration order with short-circuiting |
+| **Use case** | Logging, metrics, custom behavior | Bundling related hooks + tools | Authorization, guardrails, steering |
+| **Short-circuiting** | Manual (check `event.cancel`) | Manual | Automatic on `deny()` |
+
+**Use hooks** for observation (logging, metrics) or one-off event modifications.
+
+**Use plugins** to package related hooks and tools together as reusable modules.
+
+**Use interventions** when you need typed control decisions (allow/deny/guide), ordered evaluation with short-circuiting, or composable security and safety layers.
